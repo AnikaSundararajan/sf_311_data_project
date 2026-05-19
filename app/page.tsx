@@ -1,23 +1,114 @@
 import { Suspense } from "react";
-import type { Case311, CategoryCount } from "./lib/types";
-import CasesTable from "./components/CasesTable";
+import { connection } from "next/server";
+import type { AgencyStats } from "./lib/types";
+import AgencyTable from "./components/AgencyTable";
 
-const API_BASE = "https://data.sfgov.org/resource/vw6y-z8j6.json";
+const API = "https://data.sfgov.org/api/v3/views/vw6y-z8j6/query.json";
 
-async function getRecentCases(): Promise<Case311[]> {
-  const res = await fetch(
-    `${API_BASE}?$limit=200&$order=requested_datetime+DESC`
-  );
+async function sql<T>(query: string): Promise<T[]> {
+  const res = await fetch(`${API}?query=${encodeURIComponent(query)}`);
   if (!res.ok) return [];
-  return res.json();
+  const json = await res.json();
+  if (Array.isArray(json)) return json as T[];
+  // Socrata v3 wraps results in various shapes
+  const data = json.results ?? json.rows ?? json.data ?? [];
+  return Array.isArray(data) ? (data as T[]) : [];
 }
 
-async function getCategoryBreakdown(): Promise<CategoryCount[]> {
-  const res = await fetch(
-    `${API_BASE}?$select=service_name,count(*)+as+count&$group=service_name&$order=count+DESC&$limit=10`
-  );
-  if (!res.ok) return [];
-  return res.json();
+type OpenRow = { agency_responsible: string; open_count: string };
+type ClosedRow = {
+  agency_responsible: string;
+  requested_datetime: string;
+  closed_date: string;
+};
+type CategoryRow = {
+  agency_responsible: string;
+  service_name: string;
+  cat_count: string;
+};
+
+async function getAgencyStats(): Promise<AgencyStats[]> {
+  // connection() defers this function to request time, which is required
+  // before calling new Date() under Cache Components.
+  await connection();
+
+  // Three parallel queries: open backlog per agency, closed cases with dates
+  // for resolution time, and open cases broken down by agency+category.
+  const threeMonthsAgo = new Date();
+  threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+  const sinceDate = threeMonthsAgo.toISOString().slice(0, 10);
+
+  const [openRows, closedRows, categoryRows] = await Promise.all([
+    sql<OpenRow>(
+      `SELECT agency_responsible, count(*) as open_count
+       WHERE status_description = 'Open' AND agency_responsible IS NOT NULL
+       GROUP BY agency_responsible
+       ORDER BY open_count DESC
+       LIMIT 30`
+    ),
+    sql<ClosedRow>(
+      `SELECT agency_responsible, requested_datetime, closed_date
+       WHERE status_description = 'Closed'
+         AND closed_date IS NOT NULL
+         AND requested_datetime >= '${sinceDate}T00:00:00'
+         AND agency_responsible IS NOT NULL
+       LIMIT 5000`
+    ),
+    sql<CategoryRow>(
+      `SELECT agency_responsible, service_name, count(*) as cat_count
+       WHERE status_description = 'Open'
+         AND agency_responsible IS NOT NULL
+         AND service_name IS NOT NULL
+       GROUP BY agency_responsible, service_name
+       ORDER BY cat_count DESC
+       LIMIT 300`
+    ),
+  ]);
+
+  // Avg resolution days per agency from raw closed rows
+  const daysAccum = new Map<string, { sum: number; count: number }>();
+  for (const row of closedRows) {
+    const ms =
+      new Date(row.closed_date).getTime() -
+      new Date(row.requested_datetime).getTime();
+    if (isNaN(ms) || ms < 0) continue;
+    const agency = row.agency_responsible;
+    const prev = daysAccum.get(agency) ?? { sum: 0, count: 0 };
+    daysAccum.set(agency, { sum: prev.sum + ms / 86_400_000, count: prev.count + 1 });
+  }
+
+  // Closed count per agency (from sampled rows)
+  const closedCount = new Map<string, number>();
+  for (const row of closedRows) {
+    closedCount.set(
+      row.agency_responsible,
+      (closedCount.get(row.agency_responsible) ?? 0) + 1
+    );
+  }
+
+  // Top open categories per agency (preserve sorted order from API)
+  const catMap = new Map<string, Array<{ name: string; open_count: number }>>();
+  for (const row of categoryRows) {
+    const agency = row.agency_responsible;
+    const arr = catMap.get(agency) ?? [];
+    arr.push({ name: row.service_name, open_count: parseInt(row.cat_count) || 0 });
+    catMap.set(agency, arr);
+  }
+
+  return openRows
+    .filter((r) => r.agency_responsible?.trim())
+    .map((r) => {
+      const agency = r.agency_responsible;
+      const openCount = parseInt(r.open_count) || 0;
+      const dayStats = daysAccum.get(agency);
+      return {
+        agency,
+        open_count: openCount,
+        avg_days: dayStats ? dayStats.sum / dayStats.count : null,
+        closed_count: closedCount.get(agency) ?? 0,
+        top_categories: (catMap.get(agency) ?? []).slice(0, 4),
+      };
+    });
 }
 
 function StatCard({
@@ -44,46 +135,24 @@ function StatCard({
   );
 }
 
-const BAR_COLORS = [
-  "bg-blue-500",
-  "bg-indigo-500",
-  "bg-violet-500",
-  "bg-cyan-500",
-  "bg-teal-500",
-  "bg-sky-500",
-  "bg-purple-500",
-  "bg-blue-400",
-  "bg-indigo-400",
-  "bg-violet-400",
-];
-
 async function Dashboard() {
-  const [cases, categories] = await Promise.all([
-    getRecentCases(),
-    getCategoryBreakdown(),
-  ]);
+  const agencies = await getAgencyStats();
 
-  const open = cases.filter((c) => c.status_description === "Open").length;
-  const closed = cases.filter((c) => c.status_description !== "Open").length;
-  const total = cases.length;
+  const totalOpen = agencies.reduce((s, a) => s + a.open_count, 0);
+  const withAvg = agencies.filter((a) => a.avg_days != null);
+  const overallAvg =
+    withAvg.length > 0
+      ? withAvg.reduce((s, a) => s + a.avg_days!, 0) / withAvg.length
+      : null;
 
-  const closedWithDates = cases.filter(
-    (c) => c.status_description !== "Open" && c.closed_date
+  const mostBacklogged = agencies.reduce(
+    (max, a) => (a.open_count > (max?.open_count ?? -1) ? a : max),
+    null as AgencyStats | null
   );
-  let avgDays: string | null = null;
-  if (closedWithDates.length > 0) {
-    const totalMs = closedWithDates.reduce((sum, c) => {
-      return (
-        sum +
-        (new Date(c.closed_date!).getTime() -
-          new Date(c.requested_datetime).getTime())
-      );
-    }, 0);
-    avgDays = (totalMs / closedWithDates.length / 86_400_000).toFixed(1);
-  }
-
-  const maxCategoryCount =
-    categories.length > 0 ? parseInt(categories[0].count) || 1 : 1;
+  const slowest = withAvg.reduce(
+    (max, a) => (a.avg_days! > (max?.avg_days ?? -1) ? a : max),
+    null as AgencyStats | null
+  );
 
   return (
     <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
@@ -96,88 +165,52 @@ async function Dashboard() {
             </span>
           </div>
           <h1 className="text-2xl font-bold text-gray-900">
-            SF 311 Dashboard
+            SF Agency Investment Prioritization
           </h1>
         </div>
         <p className="text-sm text-gray-500 pl-12">
-          San Francisco service request data &middot; {total.toLocaleString()}{" "}
-          most recent requests
+          Which city agencies need more resources — and in what specific areas
         </p>
       </header>
 
-      {/* Stats */}
+      {/* Summary stats */}
       <section className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         <StatCard
-          label="Total Requests"
-          value={total.toLocaleString()}
-          sub="in current view"
-        />
-        <StatCard
-          label="Open"
-          value={open.toLocaleString()}
+          label="Total Open Cases"
+          value={totalOpen.toLocaleString()}
           valueClass="text-amber-600"
-          sub={
-            total > 0 ? `${Math.round((open / total) * 100)}% of total` : "—"
-          }
+          sub="across all agencies"
         />
         <StatCard
-          label="Closed"
-          value={closed.toLocaleString()}
-          valueClass="text-emerald-600"
-          sub={
-            total > 0
-              ? `${Math.round((closed / total) * 100)}% of total`
-              : "—"
-          }
+          label="Agencies Tracked"
+          value={agencies.length}
+          sub="with open backlog"
         />
         <StatCard
-          label="Avg Resolution"
-          value={avgDays ? `${avgDays}d` : "—"}
-          sub="days to close"
+          label="Most Backlogged"
+          value={mostBacklogged?.open_count.toLocaleString() ?? "—"}
+          sub={mostBacklogged?.agency ?? ""}
+        />
+        <StatCard
+          label="Slowest Avg Resolution"
+          value={slowest?.avg_days != null ? `${slowest.avg_days.toFixed(1)}d` : "—"}
+          valueClass="text-red-600"
+          sub={slowest?.agency ?? ""}
         />
       </section>
 
-      {/* Category breakdown */}
-      {categories.length > 0 && (
-        <section className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 mb-8">
-          <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-4">
-            Top Request Categories
-          </h2>
-          <div className="space-y-3">
-            {categories.map((cat, i) => {
-              const count = parseInt(cat.count) || 0;
-              const pct = Math.round((count / maxCategoryCount) * 100);
-              return (
-                <div key={cat.service_name} className="flex items-center gap-3">
-                  <div className="w-52 text-sm text-gray-700 truncate shrink-0">
-                    {cat.service_name || "Unknown"}
-                  </div>
-                  <div className="flex-1 bg-gray-100 rounded-full h-2">
-                    <div
-                      className={`h-2 rounded-full transition-all ${
-                        BAR_COLORS[i % BAR_COLORS.length]
-                      }`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <div className="w-12 text-xs text-gray-500 text-right tabular-nums shrink-0">
-                    {count.toLocaleString()}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-      )}
-
-      {/* Cases table */}
+      {/* Agency table */}
       <section className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-100">
           <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
-            Recent Service Requests
+            Agency Performance &amp; Investment Priority
           </h2>
+          <p className="text-xs text-gray-400 mt-1">
+            Sorted by focus score — a weighted combination of open backlog (60%)
+            and average resolution time (40%)
+          </p>
         </div>
-        <CasesTable cases={cases} />
+        <AgencyTable agencies={agencies} />
       </section>
     </main>
   );
@@ -189,9 +222,9 @@ function LoadingSkeleton() {
       <div className="mb-8">
         <div className="flex items-center gap-3 mb-1">
           <div className="w-9 h-9 bg-blue-200 rounded-lg animate-pulse" />
-          <div className="h-7 w-44 bg-gray-200 rounded animate-pulse" />
+          <div className="h-7 w-80 bg-gray-200 rounded animate-pulse" />
         </div>
-        <div className="h-4 w-72 bg-gray-100 rounded animate-pulse ml-12" />
+        <div className="h-4 w-96 bg-gray-100 rounded animate-pulse ml-12" />
       </div>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
         {[...Array(4)].map((_, i) => (
@@ -200,23 +233,27 @@ function LoadingSkeleton() {
             className="bg-white rounded-xl p-5 shadow-sm border border-gray-100"
           >
             <div className="h-3 w-20 bg-gray-100 rounded animate-pulse mb-3" />
-            <div className="h-7 w-14 bg-gray-200 rounded animate-pulse" />
+            <div className="h-7 w-14 bg-gray-200 rounded animate-pulse mb-2" />
+            <div className="h-3 w-28 bg-gray-100 rounded animate-pulse" />
           </div>
         ))}
       </div>
-      <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 mb-8">
-        <div className="h-3 w-32 bg-gray-100 rounded animate-pulse mb-4" />
-        <div className="space-y-3">
-          {[...Array(6)].map((_, i) => (
-            <div key={i} className="flex items-center gap-3">
-              <div className="h-3 w-52 bg-gray-100 rounded animate-pulse" />
-              <div className="flex-1 h-2 bg-gray-100 rounded-full animate-pulse" />
-              <div className="h-3 w-10 bg-gray-100 rounded animate-pulse" />
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-100">
+          <div className="h-3 w-48 bg-gray-100 rounded animate-pulse" />
+        </div>
+        <div className="p-5 space-y-3">
+          {[...Array(8)].map((_, i) => (
+            <div key={i} className="flex gap-4">
+              <div className="h-4 flex-1 bg-gray-100 rounded animate-pulse" />
+              <div className="h-4 w-16 bg-gray-100 rounded animate-pulse" />
+              <div className="h-4 w-16 bg-gray-100 rounded animate-pulse" />
+              <div className="h-4 w-32 bg-gray-100 rounded animate-pulse hidden lg:block" />
+              <div className="h-4 w-20 bg-gray-100 rounded animate-pulse" />
             </div>
           ))}
         </div>
       </div>
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 h-96 animate-pulse" />
     </main>
   );
 }
