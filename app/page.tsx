@@ -3,16 +3,14 @@ import { connection } from "next/server";
 import type { AgencyStats } from "./lib/types";
 import AgencyTable from "./components/AgencyTable";
 
-const API = "https://data.sfgov.org/api/v3/views/vw6y-z8j6/query.json";
+const BASE = "https://data.sfgov.org/resource/vw6y-z8j6.json";
 
-async function sql<T>(query: string): Promise<T[]> {
-  const res = await fetch(`${API}?query=${encodeURIComponent(query)}`);
+async function soql<T>(params: Record<string, string>): Promise<T[]> {
+  const url = new URL(BASE);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString());
   if (!res.ok) return [];
-  const json = await res.json();
-  if (Array.isArray(json)) return json as T[];
-  // Socrata v3 wraps results in various shapes
-  const data = json.results ?? json.rows ?? json.data ?? [];
-  return Array.isArray(data) ? (data as T[]) : [];
+  return res.json();
 }
 
 type OpenRow = { agency_responsible: string; open_count: string };
@@ -39,30 +37,26 @@ async function getAgencyStats(): Promise<AgencyStats[]> {
   const sinceDate = threeMonthsAgo.toISOString().slice(0, 10);
 
   const [openRows, closedRows, categoryRows] = await Promise.all([
-    sql<OpenRow>(
-      `SELECT agency_responsible, count(*) as open_count
-       WHERE status_description = 'Open' AND agency_responsible IS NOT NULL
-       GROUP BY agency_responsible
-       ORDER BY open_count DESC
-       LIMIT 30`
-    ),
-    sql<ClosedRow>(
-      `SELECT agency_responsible, requested_datetime, closed_date
-       WHERE status_description = 'Closed'
-         AND closed_date IS NOT NULL
-         AND requested_datetime >= '${sinceDate}T00:00:00'
-         AND agency_responsible IS NOT NULL
-       LIMIT 5000`
-    ),
-    sql<CategoryRow>(
-      `SELECT agency_responsible, service_name, count(*) as cat_count
-       WHERE status_description = 'Open'
-         AND agency_responsible IS NOT NULL
-         AND service_name IS NOT NULL
-       GROUP BY agency_responsible, service_name
-       ORDER BY cat_count DESC
-       LIMIT 300`
-    ),
+    soql<OpenRow>({
+      $select: "agency_responsible,count(*) as open_count",
+      $where: "status_description='Open' AND agency_responsible IS NOT NULL",
+      $group: "agency_responsible",
+      $order: "open_count DESC",
+      $limit: "30",
+    }),
+    soql<ClosedRow>({
+      $select: "agency_responsible,requested_datetime,closed_date",
+      $where: `status_description='Closed' AND closed_date IS NOT NULL AND requested_datetime >= '${sinceDate}T00:00:00' AND agency_responsible IS NOT NULL`,
+      $limit: "5000",
+    }),
+    soql<CategoryRow>({
+      $select: "agency_responsible,service_name,count(*) as cat_count",
+      $where:
+        "status_description='Open' AND agency_responsible IS NOT NULL AND service_name IS NOT NULL",
+      $group: "agency_responsible,service_name",
+      $order: "cat_count DESC",
+      $limit: "300",
+    }),
   ]);
 
   // Avg resolution days per agency from raw closed rows
